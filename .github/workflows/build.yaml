@@ -1,89 +1,295 @@
-name: xmlrpc-c CI CD
+name: Build xmlrpc-c
+
+permissions: write-all
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'xmlrpc-c version to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - '1.59.04'
+          - '1.64.01'
 
 jobs:
-  build_package:
+  setup-matrix:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Generating matrix
+        id: generate
+        run: |
+          pip3 install --upgrade pyyaml
+          echo "Generating matrix..."
+          MATRIX=$(python3 matrix.py)
+          echo "$MATRIX" > matrix.json
+          echo "matrix<<EOF" >> $GITHUB_ENV
+          cat matrix.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Setup matrix
+        id: set
+        uses: druzsan/setup-matrix@v2
+        with:
+          matrix: |
+            ${{ env.matrix }}
+
+  build:
+    name: v${{ matrix.version }} (${{ matrix.os }})
+    needs: setup-matrix
+    runs-on: ubuntu-latest
     strategy:
-      matrix:
-        version: ["1.59.04", "1.64.01"]
+      fail-fast: true
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    container:
+      image: ${{ 
+        startsWith(matrix.os, 'debian-') && (matrix.os == 'debian-11' && 'debian:bullseye' || matrix.os == 'debian-12' && 'debian:bookworm' || 'debian:bookworm') ||
+        startsWith(matrix.os, 'ubuntu-') && format('{0}:{1}', 'ubuntu', matrix.os == 'ubuntu-latest' && 'noble' || matrix.os == 'ubuntu-22.04' && '22.04' || matrix.os == 'ubuntu-24.04' && '24.04' || matrix.os) || '' }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      COMMITTER_NAME: ${{ secrets.COMMITTER_NAME }}
+      COMMITTER_EMAIL: ${{ secrets.COMMITTER_EMAIL }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        
+      - name: Checkout tools repository
+        uses: actions/checkout@v4
+        with:
+          repository: MediaEase-binaries/tools
+          path: tools
 
-      - name: Prepare environment
+      - name: Update APT
         run: |
-          mkdir -p dist/xmlrpc-c
+          upx="upx-ucl"
+          if [ "${{ matrix.os }}" = "debian-12" ]; then
+            echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list
+            upx="upx-ucl/bookworm-backports"
+          fi
+          apt-get update
+          apt-get install -y apt-transport-https rsync lsb-release curl wget git gzip util-linux \
+            dirmngr software-properties-common gnupg2 ca-certificates gpg-agent dos2unix nfs-common \
+            jq sudo debconf-utils build-essential checkinstall libnss3-tools nano zip \
+            unzip ssl-cert openssl libfcgi0ldbl libtool libcppunit-dev libssl-dev cmake \
+            zlib1g-dev libbz2-dev libreadline-dev libcairo2-dev libcurl4-openssl-dev libgirepository1.0-dev \
+            libncurses5-dev libncursesw5-dev xz-utils tk-dev liblzma-dev $upx \
+            autoconf-archive debian-keyring debian-archive-keyring libicu-dev libgeoip-dev \
+            intltool closure-compiler libnotify4 librsvg2-common xdg-utils pkg-config
+
+      - name: Setup variables
+        id: vars
+        run: |
+          echo "build_script=tools/packages/xmlrpc-c/build.sh" >> $GITHUB_OUTPUT
+          echo "package_name=libxmlrpc-c3" >> $GITHUB_OUTPUT
+          echo "metadata_script=tools/generate_metadata.sh" >> $GITHUB_OUTPUT
+          echo "control_file=tools/packages/xmlrpc-c/control" >> $GITHUB_OUTPUT
+          echo "package_script=tools/generate_package.sh" >> $GITHUB_OUTPUT
+          echo "install_dir=/tmp/xmlrpc-c-${{ matrix.version }}/install" >> $GITHUB_OUTPUT
+          echo "source_dir=/tmp/xmlrpc-c-${{ matrix.version }}/source" >> $GITHUB_OUTPUT
+          echo "version=${{ matrix.version }}" >> $GITHUB_OUTPUT
+          codename=$(lsb_release -cs)
+          distro=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+          real_os="$distro-$codename"
+          echo "real_os=$real_os" >> $GITHUB_OUTPUT
+          echo "deb_name=libxmlrpc-c3_${{ matrix.version }}-1build1_${real_os}_amd64.deb" >> $GITHUB_OUTPUT
+
+      - name: Make scripts executable
+        run: |
+          find tools/ -name "*.sh" -exec chmod +x {} \;
+
+      - name: Prepare directories
+        run: |
+          rm -rf "/tmp/xmlrpc-c-${{ matrix.version }}"
+          mkdir -p "${{ steps.vars.outputs.install_dir }}"
+          mkdir -p "${{ steps.vars.outputs.source_dir }}"
+
+      - name: Extract source
+        run: |
+          ZIPFILE="tools/extras/xmlrpc-c/xmlrpc-c-${{ matrix.version }}.zip"
+          if [ ! -f "$ZIPFILE" ]; then
+            echo "Error: The file $ZIPFILE does not exist."
+            exit 1
+          fi
+          unzip "$ZIPFILE" -d "${{ steps.vars.outputs.source_dir }}/tmp"
+          TOPDIR=$(ls "${{ steps.vars.outputs.source_dir }}/tmp" | head -1)
+          mv "${{ steps.vars.outputs.source_dir }}/tmp/$TOPDIR"/* "${{ steps.vars.outputs.source_dir }}"
+          rm -rf "${{ steps.vars.outputs.source_dir }}/tmp"
 
       - name: Build xmlrpc-c
         run: |
-          chmod +x ./build.sh
-          ./build.sh ${{ matrix.version }}
+          echo "Building xmlrpc-c ${{ matrix.version }}"
+          cp -pR "${{ steps.vars.outputs.build_script }}" "${{ steps.vars.outputs.source_dir }}"
+          cd "${{ steps.vars.outputs.source_dir }}"
+          ./build.sh "${{ steps.vars.outputs.install_dir }}"
+          find "${{ steps.vars.outputs.install_dir }}" -type f -executable -exec file {} \; \
+            | grep "ELF.*executable" \
+            | cut -d: -f1 \
+            | xargs --no-run-if-empty -I{} sh -c 'echo "Processing: {}" && strip --strip-unneeded "{}" && echo "  ✓ Stripped" && if command -v upx >/dev/null 2>&1; then upx --best --lzma "{}" && echo "  ✓ Compressed with UPX"; else echo "  ℹ UPX not available"; fi' || echo "Warning: Some files could not be processed"
 
-      - name: Create Debian package
+      - name: Create package
         run: |
-          PKG_DIR="package_xmlrpc-c"
-          mkdir -p "$PKG_DIR/DEBIAN" "$PKG_DIR/usr"
-          cp -r custom_build/install/usr/* "$PKG_DIR/usr/"
-          installed_size=$(du -s -k "$PKG_DIR" | cut -f1)
-          cat > "$PKG_DIR/DEBIAN/control" <<EOF
-          Package: xmlrpc-c
-          Version: ${{ matrix.version }}-1build1
-          Architecture: amd64
-          Maintainer: Thomas Chauveau <contact.tomc@yahoo.com>
-          Installed-Size: $installed_size
-          Depends: libc6
-          Section: net
-          Priority: optional
-          Homepage: https://xmlrpc-c.sourceforge.io/
-          Description: Lightweight XML-RPC library for C and C++
-            xmlrpc-c is a lightweight, portable, and efficient library for XML-RPC communication.
-            .
-            Version: ${{ matrix.version }}
-            .
-            Compiled on $(date +%Y-%m-%d).
-          EOF
-          cd "$PKG_DIR"
-          find usr -type f -exec md5sum {} \; > DEBIAN/md5sums
-          cd ..
-          dpkg-deb --build -Zxz -z9 -Sextreme "$PKG_DIR" "xmlrpc-c_${{ matrix.version }}-1build1_amd64.deb"
-          mkdir artifacts
-          mv *.deb artifacts/
+          mkdir -p "${{ steps.vars.outputs.install_dir }}/DEBIAN"
+          DATE=$(date +%Y-%m-%d)
+          INSTALLED_SIZE=$(du -ks "${{ steps.vars.outputs.install_dir }}/usr" | cut -f1)
+          cp -pR ${{ steps.vars.outputs.control_file }} "${{ steps.vars.outputs.install_dir }}/DEBIAN/control"
+          sed -i -e "s/@VERSION@/${{ steps.vars.outputs.version }}/g" \
+            -e "s/@ARCH@/amd64/g" \
+            -e "s/@DATE@/${DATE}/g" \
+            -e "s/@INSTALLED_SIZE@/${INSTALLED_SIZE}/g" \
+            -e "s/@MAINTAINER@/${{ env.COMMITTER_NAME }} <${{ env.COMMITTER_EMAIL }}>/g" \
+            "${{ steps.vars.outputs.install_dir }}/DEBIAN/control"
+          find ${{ steps.vars.outputs.install_dir }}/ -type f ! -path "./DEBIAN/*" -exec md5sum {} \; > ${{ steps.vars.outputs.install_dir }}/DEBIAN/md5sums
+          dpkg-deb --build -Zxz -z9 -Sextreme --root-owner-group "${{ steps.vars.outputs.install_dir }}" "${{ steps.vars.outputs.deb_name }}"
 
-      - name: Upload Debian package
+      - name: Generate metadata
+        run: |
+          deb=$(find / -name "libxmlrpc-*.deb")
+          mkdir -p artifacts
+          cp "$deb" artifacts/
+          cd artifacts
+          echo "Generating metadata for DEB file: ${{ steps.vars.outputs.deb_name }}"
+          ../${{ steps.vars.outputs.metadata_script }} \
+            --category "xmlrpc-c" \
+            --version "${{ matrix.version }}" \
+            "$deb"
+          ls -l
+
+      - name: Upload as Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xmlrpc-c-${{ matrix.version }}
-          path: artifacts/*.deb
+          name: xmlrpc-c-${{ matrix.version }}-${{ matrix.os }}
+          path: artifacts/*
+          retention-days: 1
 
-  create_release:
-    name: Create GitHub Release
+  release:
+    name: Create Releases
+    needs: build
     runs-on: ubuntu-latest
-    needs: build_package
-
+    
+    strategy:
+      matrix:
+        version: ["1.59.04", "1.64.01"]
+      fail-fast: false
+    
     steps:
-      - name: Download all artifacts
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Download artifacts for this version
         uses: actions/download-artifact@v4
         with:
           path: downloaded_artifacts
-
+          pattern: xmlrpc-c-${{ matrix.version }}*
+      
       - name: Prepare release assets
-        id: prepare_release
+        id: prepare-release-assets
         run: |
-          mkdir release_assets
-          find downloaded_artifacts -type f -exec cp {} release_assets/ \;
-          echo "today=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+          mkdir -p release_assets
+          find downloaded_artifacts -type f \
+            \( -name "libxmlrpc-*${{ matrix.version }}*.deb" -o \
+              -name "libxmlrpc-*${{ matrix.version }}*.json" \) \
+            -exec cp {} release_assets/ \;
+          TEMP_DIR=$(mktemp -d)
+          PACKAGES_TABLE="$TEMP_DIR/packages.md"
+          CONFIG_TABLE="$TEMP_DIR/config.md"
+          {
+            echo "| Package | OS |"
+            echo "| ------- | -- |"
+            for f in release_assets/*.deb; do
+              if [ -f "$f" ]; then
+                pkg=$(basename "$f")
+                os=$(echo "$pkg" | grep -o "debian-[^ _]*\|ubuntu-[^ _]*" || echo "unknown")
+                distro_version=$(echo "$os" | sed 's/debian-/Debian /;s/ubuntu-/Ubuntu /')
+                echo "| $pkg | $distro_version |"
+              fi
+            done
+          } > "$PACKAGES_TABLE"
 
-      - name: Create GitHub Release
+          {
+            echo "| Build Configuration |"
+            echo "| ------------------ |"
+            echo "| \`./configure --prefix=/usr\` |"
+          } > "$CONFIG_TABLE"
+          
+          echo "packages_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$PACKAGES_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "config_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$CONFIG_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "Files prepared for release:"
+          ls -la release_assets/
+      
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Release ${{ steps.prepare_release.outputs.today }}
-          tag_name: v${{ steps.prepare_release.outputs.today }}
-          generate_release_notes: true
+          tag_name: v${{ matrix.version }}
+          name: xmlrpc-c ${{ matrix.version }}
           files: |
             release_assets/*
+          draft: false
+          generate_release_notes: true
+          body: |
+            # libxmlrpc-c3 ${{ matrix.version }}
+
+            Pre-built XMLRPC-C library packages for various Linux distributions.
+
+            ## 🎯 Features
+
+            - Pre-compiled XMLRPC-C library
+            - Multiple distribution support
+            - Automated builds via GitHub Actions
+            - JSON metadata for automated installations
+            - Optimized for MediaEase applications
+
+            ## 📦 Available Packages
+
+            ${{ steps.prepare-release-assets.outputs.packages_table }}
+
+            ## 🔧 Build Configuration
+
+            ${{ steps.prepare-release-assets.outputs.config_table }}
+
+            ## 📋 Installation
+
+            ### Manual Installation
+            1. Download the appropriate .deb package for your distribution
+            2. Install using: `sudo dpkg -i package_name.deb`
+            3. Fix any dependencies if needed: `sudo apt-get install -f`
+
+            ## 🔍 Package Details
+
+            The packages include:
+            - XMLRPC-C library
+            - Development headers
+            - System-wide installation in `/usr/local`
+            - Optimized for server usage
+
+            ## 📄 Metadata
+
+            Each package is accompanied by its JSON metadata file containing:
+            - Package information
+            - Checksums
+            - Dependencies
+            - Build configuration
+            - Distribution details
+
+            ## 📝 License
+
+            XMLRPC-C is distributed under the [BSD License](https://github.com/mirror/xmlrpc-c/blob/master/doc/COPYING).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
